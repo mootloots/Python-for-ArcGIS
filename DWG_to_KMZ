@@ -1,0 +1,104 @@
+#           Script for Converting Input CAD .dwg Files into .kmz for Implementation into 3GIS
+#
+#       About CAD Coordinate Systems: 
+#               https://pro.arcgis.com/en/pro-app/latest/help/data/cad/about-cad-coordinate-systems.htm
+# 
+
+# Import Packages
+print('Loading packages...')
+import os, traceback, arcpy
+print('Packages loaded.\n')
+
+# Global Variables
+default_sr = arcpy.SpatialReference(3857) #WGS1984 (what the KMZ tool expects), otherwise NAD1983 wkid is 4326
+dir_path = r"PATH/CADtoKMZ/InputDWGs/"
+out_path = r"PATH/CADtoKMZ/OutputKMZs/"
+gdb = r"PATH/TO/GDB.gdb"
+
+'''
+# Check to see if connected to Network Drive
+print('Connecting to network...')
+if os.path.exists('W:/'):
+	print('Connected.\n')
+	pass
+else:
+	print('Could not connect to network drive W:/')
+	print('Exiting script...')
+	raise SystemExit()
+'''
+# Gather CAD .dwg's to Process
+print('Finding CAD drawings...')
+ext = '.dwg'
+dwg_list = []
+# 		Tell Arc where to look for files
+arcpy.env.workspace = dir_path
+[os.rename(os.path.join(dir_path, file), os.path.join(dir_path, file.replace(" ", "0"))) for file in os.listdir(dir_path) if file.endswith(ext)]
+#		Put files in list
+for file in os.listdir(dir_path):
+	if file.endswith(ext):
+		name = file[:-4]
+		os.rename(os.path.join(dir_path, file), os.path.join(dir_path, name.replace('.', '0'))+'.dwg')
+		full_path = os.path.join(dir_path, name) +'.dwg'
+		dwg_list.append(full_path) # Add to list of files
+	else:
+		continue
+print('Drawings compiled:')
+print(dwg_list)
+print('\n')
+
+# Perform Geoprocessing for each CAD Drawing
+print('Processing...\n')
+#	Clear gdb
+arcpy.env.workspace = gdb
+gdb_list = arcpy.ListFeatureClasses() + arcpy.ListDatasets()
+[arcpy.Delete_management([item]) for item in gdb_list]
+arcpy.env.workspace = dir_path
+
+#   Iterate through .dwg list
+arcpy.env.overwriteOutput = True
+reference_scale = '1000'
+line_query = ""
+point_query = ""
+counter = 0
+
+for file in arcpy.ListDatasets(dwg_list):
+    counter += 1
+    print('Current file: '+str(counter)+'. '+file)
+    f_name = os.path.splitext(file)[0]
+    f_name_pl = f_name + '_Route_KMZ'
+    f_name_point = f_name + '_Point_KMZ'
+    full_path = dir_path + file
+    if counter > 1:
+        f_gdb_line = gdb + '/' + f_name + '/Polyline_' + str(counter-1)
+        f_gdb_point = gdb + '/' + f_name + '/Point_' + str(counter-1)
+    else:  
+        f_gdb_line = gdb + '/' + f_name + '/Polyline'
+        f_gdb_point = gdb + '/' + f_name + '/Point'
+    outKMZ_line = os.path.join(out_path, f_name + '_Routes.kmz')
+    outKMZ_point = os.path.join(out_path, f_name +'_AP.kmz')
+
+    # CAD to GDB tool : https://pro.arcgis.com/en/pro-app/latest/tool-reference/conversion/cad-to-geodatabase.htm
+    print('Importing...')
+    arcpy.CADToGeodatabase_conversion(full_path, gdb, f_name, reference_scale, default_sr)
+    arcpy.MakeFeatureLayer_management(f_gdb_line, f_name_pl, line_query, gdb)
+    arcpy.MakeFeatureLayer_management(f_gdb_point, f_name_point, point_query, gdb)
+    print('Converting...')
+    # Layer to KML(Z) tool : https://pro.arcgis.com/en/pro-app/latest/tool-reference/conversion/layer-to-kml.htm
+    arcpy.LayerToKML_conversion(f_name_pl, outKMZ_line)
+    arcpy.LayerToKML_conversion(f_name_point, outKMZ_point)
+
+    # Remove Layers and Variables
+    arcpy.env.workspace = gdb
+    arcpy.Delete_management([f_name_pl, f_name_point])
+    print(file + ' converted to ' + f_name + '_Routes.kmz and '+ f_name + '_AP.kmz\n')
+    del full_path, f_name, f_gdb_line, f_gdb_point, outKMZ_line, outKMZ_point
+
+# Replace placeholder '0's with spaces and clear GDB
+[os.rename(os.path.join(dir_path, file), os.path.join(dir_path, file.replace("0", " "))) for file in os.listdir(dir_path)]
+[os.rename(os.path.join(out_path, file), os.path.join(out_path, file.replace("0", " "))) for file in os.listdir(out_path)]
+[arcpy.Delete_management([item]) for item in gdb_list]
+
+print('KMZs created. \nProcessing complete. \nExiting script...')
+
+# Empty Input Folder
+#[os.remove([file]) for file in os.listdir(dir_path) if file.endswith(ext)]
