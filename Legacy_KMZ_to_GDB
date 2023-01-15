@@ -1,0 +1,139 @@
+#       Legacy KMZ to GDB - Conversion
+#       
+#       This script converts KMZ files whom were output in a format that placed all of their attribute data
+#       into a single HTML field titled 'PopupInfo'.  It parses out the HTML and translates the many field names 
+#       into uniform fields to reinsert them into the attribute table of the feature class.
+#       Export to SHP: Uncomment lines [21, 134, 191]
+
+import arcpy, os, datetime
+import pandas as pd
+
+
+print("\n \nGetting set up...")
+
+dir_path = r'C:/PATH/KMZtoSHP/'
+gdb = r"C:/PATH/.gdb"
+kmz_gdbs = r'C:/PATH/KMZ_GDBs'
+# out_SHPs = r'C:/PATH/KMZ_SHPs'
+
+mxd = arcpy.mp.ArcGISProject(r'C:/PATH.aprx')
+coord_sys = arcpy.SpatialReference(4326)
+arcpy.env.overwriteOutput = True
+df = mxd.listMaps()[0]
+date_strf = str(datetime.date.today().strftime("%Y%m%d"))
+
+
+                # Final fields desired, aka list(orig_dict.keys())
+finalFields = ['JOB_NAME', 'FQN_ID', 'HUB', 'PERMIT_AGENCY', 'SITE_SPAN', 'STATUS', 'FIBER_SIZE', 
+                    'NFID', 'HAUL_TYPE', 'ROUTE', 'ROUTE_TYPE', 'NETWORK_TYPE', 'REEL_NUMBER', 'CREATED_USER', 
+                    'CREATED_DATE', 'LAST_EDITED_USER', 'LAST_EDITED_DATE', 'LENGTH_FEET', 'POPUPINFO']
+                # Superfluous empty fields common to all of these .kmzs regardless of input method
+removeFields = ['FolderPath', 'SymbolID', 'AltMode', 'Base', 'Clamped', 'Extruded', 'Snippet']
+                
+allFields = [   # List of every field name in the .kmz selection provided
+*]
+                
+orig_dict = {   # Dictionary to take values from similar ORIGINAL fields and input them into the new fields
+            *
+            }
+
+            # Translate dictionary to make all FIELD NAMES uniform
+separators = { ord(' '):ord('_'), ord('&'):ord('_'), ord('-'):ord('_'), ord('('):ord('_'), ord(')'):ord('_'), 
+                ord('#'):ord('_'), ord('/'):ord('_'), ord('\\'):ord('_') }
+
+# Gather all KMZs, convert to Features.  This tool exports each KMZ to a separate GDB
+print('Gathering .kmz files...')
+kmz_list = []
+for file in os.listdir(dir_path):
+    if file.endswith('.kmz'):
+        os.rename(os.path.join(dir_path, file), os.path.join(dir_path, file.translate(separators)))
+        file_path = os.path.join(dir_path, file.translate(separators))
+        kmz_list.append(file_path)
+print('Converting to GDB files...')
+for kmz in kmz_list:
+    arcpy.KMLToLayer_conversion(kmz, kmz_gdbs)
+    print(os.path.basename(kmz), os.path.basename(kmz[:-4]), sep = ' ----> ', end='.gdb\n')
+
+# Collect list of new KMZ GDBs
+arcpy.env.workspace = kmz_gdbs
+kmz_gdb_list = arcpy.ListWorkspaces('*', 'FileGDB')
+for kmz_gdb in kmz_gdb_list:
+    kmz_gdb = kmz_gdb.replace(' ', '_')
+e_count = 0     #error counter
+
+# Iterate through each new GDB, selecting only the polyline features and parsing out the 
+#       'PopupInfo' field into full tables   
+counter = 0
+# names_master = []    # Uncomment this line and 136-145 to gather full list of field names in order to set orig_dict dictionary to desired translations
+                       # From there, either view list in debug or write list to .txt using write() or pickle()
+print('\nBeginning table reconstruction:')
+
+# testList = kmz_gdb_list[:3]
+for kmz_gdb in kmz_gdb_list:  
+    counter += 1
+    print(str(counter)+'. '+kmz_gdb)
+    arcpy.env.workspace = kmz_gdb
+    f_name = os.path.splitext(kmz_gdb)[0]
+    f_name_shp = f_name + '_Route_SHP'
+    kmz_pl = kmz_gdb + '/Placemarks/Polylines'
+    # outSHP = os.path.join(out_SHPs, f_name_shp)
+    #   Collect and add fields from PopupInfo 
+    # print("Parsing HTML...")
+    # with arcpy.da.SearchCursor(kmz_pl, 'PopupInfo') as sc:        
+    #     for row in sc:
+    #         pop_string = row[0]
+    #         pop_length = len(pop_string)
+    #         tabs = pd.read_html(pop_string, keep_default_na=True)
+    #         pop_df = tabs[1]
+    #         names_array = list(pop_df[0])
+    #         names_array = [name.upper().translate(separators) for name in names_array]
+    #         [names_master.append(name) for name in names_array if name not in names_array]
+
+    print("Removing unnecessary fields...")
+    for fields in arcpy.ListFields(kmz_pl):
+        if fields.name in removeFields:
+            arcpy.DeleteField_management(kmz_pl, fields.name)
+    # Add Fields
+    print("Adding new fields to table...")
+    for field in finalFields:
+        try:
+            arcpy.AddField_management(kmz_pl, field, "TEXT")
+        except:
+            print("Field '"+field+"' already exists.  Passing over...")
+            continue
+
+    # Update new finalFields for each feature in Polyline layer
+    with arcpy.da.UpdateCursor(kmz_pl, finalFields) as cursor:
+        for row in cursor:
+            pop_string = row[-1]
+            tabs = pd.read_html(pop_string, keep_default_na=True)
+            pop_df = tabs[1]
+            # Change field names of desired fields in pop_df to name in finalFields
+            drop_index = []
+            for x in range(len(pop_df)):
+                if str(pop_df.iloc[x, 0]).upper().translate(separators) in list(orig_dict.keys()):
+                    pop_df.iloc[x, 0] = orig_dict.get(str(pop_df.iloc[x, 0]).upper().translate(separators))
+                else:
+                    drop_index.append(x)
+                    continue
+            # Drop unwanted fields by index, then reindex by name of field in common with finalFields
+            pop_df.drop(drop_index, axis=0, inplace=True)
+            pop_df.drop_duplicates(subset=0, keep='last', inplace=True) # some of the EDITOR features have two references, the first occurance being empty, so we keep the last one
+            pop_df.set_index(0, inplace=True)
+            #       For any desired fields not found in the PopupInfo, we need to add them to the 
+            #       index as NaN values in order to iterate down the row of the current feature
+            addList = []
+            [addList.append(field) for field in finalFields if (field not in list(pop_df.index)) and (field != 'POPUPINFO')]
+            for item in addList:
+                pop_df.loc[item] = 'NaN'
+            #  Now to reorder the df's index to match the order of fields in the feature we're editing
+            finaFields = finalFields[:-1]  #shorten finalFields to exclude PopupInfo (else we'd overwrite it with NaN too)
+            pop_df = pop_df.loc[finaFields]
+            for y in range(len(pop_df)):
+                row[y] = pop_df.iloc[y, 0]
+            cursor.updateRow(row)
+    # Export to Shapefile
+    # arcpy.ExportFeatures_conversion(kmz_pl, outSHP)
+    print(os.path.basename(kmz_gdb)+" finished.\n")
+print('Script complete.')
+
