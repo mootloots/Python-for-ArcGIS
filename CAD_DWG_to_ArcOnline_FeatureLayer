@@ -1,0 +1,391 @@
+#
+#			Script for taking CAD .dwg Files and updating an ArcGIS Online feature layer of Polylines, Points
+#
+#						NOTE: 	Will only work with Python 3.x; will not work with ArcGIS Desktop (ArcMap)
+#								ArcGIS Pro uses Python 3.x, ArcMap uses Python 2.x 
+#								Compatible with any computer that has ArcGIS Pro installed
+#								If necessary, install latest version of Python to run on a machine without ArcPro 
+#								Must be connected to Team Fishel VPN to access network drive
+#
+#  				Find Python under c:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3
+#  				Set PYTHONPATH https://www.simplilearn.com/tutorials/python-tutorial/python-path
+#  				https://resources.arcgis.com/en/help/main/10.2/index.html#/
+#  				
+#				Currently setup to run within an ArcGIS session, to get status messages in an IDE: Ctrl+H, Find=arcpy.AddMessage, Replace=print
+
+# Import packages #
+import os, sys, traceback, datetime, arcpy, shutil
+import pandas as pd
+from zipfile import is_zipfile
+from arcgis.gis import GIS
+from arcgis.features import FeatureLayer, GeoAccessor, GeoSeriesAccessor
+arcpy.AddMessage("Packages loaded.")
+
+# Global Variables #
+proj_path = r"PATH/TO/FILE.aprx"
+gdb = r"PATH/TO/GDB.gdb"
+dir_path = r"PATH/TO/DWG/CONTAINING/FOLDER/" 
+archive = r"PATH/TO/ARCHIVE/FOLDER/"
+layer_id = r'ID_OF_ONLINE_LAYER'
+default_sr = arcpy.SpatialReference(4326)
+date = str(datetime.date.today())
+date_strf = str(datetime.date.today().strftime("%Y%m%d"))
+
+# Functions #
+def clear_gdb():
+        arcpy.env.workspace = gdb
+        gdb_list = arcpy.ListFeatureClasses() + arcpy.ListDatasets() + arcpy.ListTables()
+        [arcpy.Delete_management([item]) for item in gdb_list]
+
+		# makes shutil.make_archive() easier to deal with
+def make_archive(source, destination):
+        base = os.path.basename(destination)
+        name = base.split('.')[0]
+        format = base.split('.')[1]
+        archive_from = os.path.dirname(source)
+        archive_to = os.path.basename(source.strip(os.sep))
+        # arcpy.AddMessage(source, destination, archive_from, archive_to)
+        shutil.make_archive(name, format, archive_from, archive_to)
+        shutil.move('%s.%s'%(name,format), destination)
+
+def remove_dup_lines():
+	lineLayer = flayer.layers[1]
+	lineFeatures = lineLayer.query().features
+
+	line_df = lineLayer.query().sdf
+	line_dup = line_df.drop_duplicates(subset=['Job_Name', 'Design_Stage'], keep='last')
+	line_dup = line_dup.drop_duplicates(subset='Job_Name', keep='last')
+	oid_keep = list(line_dup['OBJECTID'])
+
+	del_features = [f for f in lineFeatures if f.attributes['OBJECTID'] not in oid_keep]
+	oid_del = []
+	[oid_del.append(str(f.get_value('OBJECTID'))) for f in del_features]
+	lineLayer.edit_features(deletes=oid_del)
+	arcpy.AddMessage('Duplicate Polyline features removed.')
+
+def remove_dup_points():
+    pointLayer = flayer.layers[0]
+    pointFeatures = pointLayer.query().features
+
+    feat_subset = [f for f in pointFeatures if f.attributes['Job_Name'] in jobList]
+    oid_del = []
+    for f in feat_subset:
+        if (f.attributes['CreationDate'] == None) or (int(f.attributes['CreationDate']) < int(date_strf)):
+            oid_del.append(str(f.get_value('OBJECTID')))
+    [pointLayer.edit_features(deletes=oid) for oid in oid_del if len(oid_del) > 0]
+    arcpy.AddMessage('Duplicate Point features removed.')
+
+
+# Field Dictionaries
+fd_line = { #line feature class fields
+  *
+	}
+
+fd_point = { #point feature class fields
+	*
+  }
+
+cust_dict = {
+  *
+}
+
+# wkid_dict = { #Coordinate Systems for different job locations,	
+  *
+# 	# wkid list: https://pro.arcgis.com/en/pro-app/latest/arcpy/classes/pdf/projected_coordinate_systems.pdf
+# }
+
+separators = { #for PDF naming convention: change to match job name in order to search for correct feature to append to
+			 ord('_'):ord(' '), ord(','):ord(' '), ord('.'):ord(' '), ord('&'):ord(' '), ord('-'):ord(' '), ord('('):ord(' '), ord(')'):ord(' '), ord('#'):ord(' ')}
+			 # Most likely breakpoint for not finding the PDF; PDF name may have a different special character as a separator
+
+# # Check to see if connected to Network Drive
+# arcpy.AddMessage('Connecting to network...')
+# if os.path.exists('W:/'):
+# 	arcpy.AddMessage('Connected.')
+# 	pass
+# else:
+#     arcpy.AddMessage('\nCould not connect to network drive W:/')
+#     arcpy.AddMessage('Check connection to VPN and try again.')
+#     arcpy.AddMessage('Exiting script...')
+#     raise SystemExit()
+
+arcpy.AddMessage('Logging into ArcGIS Online...')
+user = ''
+password = ''
+try:
+	gis = GIS('https://URL.TO.ORG.ArcGIS.Online/', user, password)  #not specifying password will prompt for user input
+	un = gis.properties.user.username
+	arcpy.AddMessage('Logged in as: {}'.format(un))
+except Exception as error:
+	arcpy.AddMessage(error)
+	arcpy.AddMessage('Login Failed')
+	arcpy.AddMessage('Exiting script...')
+	raise SystemExit()
+
+# Gather CAD .dwg's to Process
+arcpy.AddMessage('Finding CAD drawings...\n')
+ext = '.dwg'
+dwg_list = []
+# 		Tell Arc where to look for files
+arcpy.env.workspace = dir_path
+[os.rename(os.path.join(dir_path, file), os.path.join(dir_path, file.replace(" ", "999"))) for file in os.listdir(dir_path) if file.endswith(ext)]
+#		Put files in list
+for file in os.listdir(dir_path):
+	if file.endswith(ext):
+		name = file[:-4]
+		os.rename(os.path.join(dir_path, file), os.path.join(dir_path, name.replace('.', '999'))+'.dwg')
+		full_path = os.path.join(dir_path, name) +'.dwg'
+		counter = file.count('_') # Perform check for two underscores
+		if counter == 2:
+			dwg_list.append(full_path) # Add to list of files
+		else:
+			continue
+	else:
+		continue
+#       Exit operation if no .dwgs are found in folder
+if len(dwg_list) == 0:
+    arcpy.AddMessage("No .dwg files found. \nExiting script...")
+    raise SystemExit()
+
+arcpy.AddMessage('Drawings compiled:')
+arcpy.AddMessage(dwg_list)
+
+# Perform Geoprocessing for each CAD Drawing
+arcpy.AddMessage('\nProcessing...\n')
+default_sr 		#set SpatialReference to NAD1983
+
+#		Clear gdb
+clear_gdb()
+#		Create Polyline and Point feature layers to hold input feature classes
+arcpy.CreateFeatureclass_management(gdb, 'cad_line', 'POLYLINE', spatial_reference=default_sr)
+arcpy.MakeFeatureLayer_management(gdb + '/cad_line', 'cad_line')
+arcpy.CreateFeatureclass_management(gdb, 'cad_point', 'POINT', spatial_reference=default_sr)
+arcpy.MakeFeatureLayer_management(gdb + '/cad_point', 'cad_point')
+
+arcpy.AddFields_management('cad_line', [fd_line[''], fd_line[''], fd_line[''], fd_line[''], fd_line[''], fd_line[''], \
+	fd_line[''], fd_line[''], fd_line[''], fd_line[''], fd_line['']])
+arcpy.AddFields_management('cad_point', [fd_point[''],  fd_point[''], fd_point[''], fd_point[''], fd_point[''], fd_point[''], fd_point['']])
+
+# Iterate through dwg list
+arcpy.env.workspace = dir_path
+arcpy.env.overwriteOutput = True
+line_query = "QUERY TO SELECT DESIRED FEATURES"
+point_query = "QUERY TO SELECT DESIRED FEATURES"
+counter = 0
+jobList = []
+
+deleteFields = ['Entity', 'Handle', 'Layer', 'LyrFrzn', 'LyrOn', 'Color', 'Linetype', 'Elevation', 'LineWt', \
+		'RefName', 'DocUpdate', 'DocId', 'X3', 'X2', 'X1']
+    
+for file in arcpy.ListDatasets(dwg_list):
+	
+	counter += 1
+	arcpy.AddMessage(str(counter)+'. '+file)
+	f_name = os.path.splitext(file)[0]
+	full_path = dir_path + file
+	if counter > 1:
+		f_gdb_line = gdb + '/' + f_name + '/Polyline_'+str(counter-1)
+		f_gdb_point = gdb + '/' + f_name + '/Point_'+str(counter-1)
+	else:
+		f_gdb_line = gdb + '/' + f_name + '/Polyline'
+		f_gdb_point = gdb + '/' + f_name + '/Point'
+	file_pl = gdb + '/file_pl'
+	file_dissolved = gdb + '/file_dissolved'
+	file_point = gdb + '/file_point'
+	
+  #Parse file name for x, y, z
+	new_fields = f_name.split("_")
+	x = str(new_fields[0]).upper()
+	x = cust_dict[x]
+	y = str(new_fields[1]).upper()
+	y = y.replace("999", " ")
+	jobList.append(y)
+	z = str(new_fields[2]).upper()
+
+	#Extract Desired Polylines from file
+	#try:
+	#	arcpy.CADToGeodatabase_conversion(full_path, gdb, f_name, '1000', arcpy.SpatialReference(wkid_dict[job]))
+	#except:
+	arcpy.AddMessage('Extracting design route...')
+	arcpy.CADToGeodatabase_conversion(full_path, gdb, f_name, '1000', default_sr)
+	arcpy.FeatureClassToFeatureClass_conversion(f_gdb_line, gdb, 'file_pl', line_query)
+
+	#Merge (Dissolve) Polylines to one feature
+	arcpy.Dissolve_management(file_pl, file_dissolved, multi_part="MULTI_PART", unsplit_lines="DISSOLVE_LINES")
+	
+	#Delete fields from attribute table
+	arcpy.DeleteField_management(file_dissolved, deleteFields, 'DELETE_FIELDS')
+
+	#Add and populate new fields	
+	arcpy.AddFields_management(file_dissolved, [fd_line[' '], fd_line[' '], fd_line[' ']])
+	arcpy.CalculateField_management(file_dissolved, " ", "'"+x+"'")
+	arcpy.CalculateField_management(file_dissolved, " ", "'"+y+"'")
+	arcpy.CalculateField_management(file_dissolved, " ", "'"+z+"'")
+
+	#add to 'cad_line' layer
+	arcpy.Append_management(file_dissolved, 'cad_line', "NO_TEST")
+	arcpy.AddMessage('Route extraction complete.')
+
+	#Extract Points from file
+	arcpy.AddMessage('Extracting access points...')
+	arcpy.FeatureClassToFeatureClass_conversion(f_gdb_point, gdb, 'file_point', point_query)
+
+	#Update Access Point Fields
+	arcpy.AddFields_management(file_point, [fd_point[' '], fd_point['x'], fd_point['y'], fd_point['z']])
+	arcpy.CalculateField_management(file_point, "Customer", "'"+x+"'")
+	arcpy.CalculateField_management(file_point, "Job_Name", "'"+y+"'")
+	arcpy.CalculateField_management(file_point, "Design_Stage", "'"+z+"'")
+
+	#		Check whether access point is MH or HH and update 'Name' field per feature
+	with arcpy.da.UpdateCursor(file_point, ['RefName', 'Name']) as cursor:
+		for row in cursor:
+			if row[0].find('MH') >= 0 :
+				row[1] = 'MH'
+			elif row[0].find('MAN') >= 0 :
+				row[1] = 'MH'
+			else:
+				row[1] = 'HH'
+			cursor.updateRow(row)
+
+	#		Remove undesired fields			
+	arcpy.DeleteField_management(file_point, deleteFields, 'DELETE_FIELDS')
+
+	#arcpy.AddGeometryAttributes_management(file_point, [['Longitude', 'POINT_X'], ['Latitude', 'POINT_Y']])
+
+	#Add to 'cad_point' layer
+	arcpy.Append_management(file_point, 'cad_point', 'NO_TEST')
+	arcpy.AddMessage('Access point extraction complete.')
+
+	#clear variables and gdb
+	arcpy.Delete_management([f_name, file_pl, file_dissolved, file_point])
+	del f_name, full_path, f_gdb_line, f_gdb_point, new_fields, customer, job, design
+	arcpy.AddMessage(file + " done.\n")
+
+	
+arcpy.AddMessage('Processing complete.')
+arcpy.AddMessage('Saving feature classes...')
+######  Using this to get proper name in working Scratch.gdb  ######
+out_line_fc = 'CAD_Routes_'+ date_strf
+out_point_fc = 'CAD_AccessPoints_'+ date_strf
+arcpy.FeatureClassToFeatureClass_conversion('cad_line', gdb, out_line_fc)
+arcpy.FeatureClassToFeatureClass_conversion('cad_point', gdb, out_point_fc)
+arcpy.Delete_management(['cad_line', 'cad_point'])
+arcpy.AddMessage('Done.\n')
+
+# Bring new feature classes into open instance of ArcPro
+p = arcpy.mp.ArcGISProject(proj_path)
+arcpy.env.workspace = gdb
+arcpy.env.overwriteOutput = True
+cad_line = arcpy.ListFeatureClasses("CAD_Routes_*")[0]
+cad_point = arcpy.ListFeatureClasses("CAD_AccessPoints_*")[0]
+
+# Export to GDB and Zip for AOL Compatability
+arcpy.AddMessage('Saving as discrete file geodatabase...')
+newGDB = 'CAD_to_AOL_Update_'+ date_strf +'.gdb'
+newGDB_path = os.path.join(archive, newGDB)
+newGDB_zip = os.path.splitext(newGDB_path)[0]+'.zip'
+out_line_fc = 'CAD_Routes_'+ date_strf
+out_point_fc = 'CAD_AccessPoints_'+ date_strf
+
+arcpy.CreateFileGDB_management(archive, newGDB, 'CURRENT')
+arcpy.FeatureClassToFeatureClass_conversion(cad_line, newGDB_path, out_line_fc)
+arcpy.FeatureClassToFeatureClass_conversion(cad_point, newGDB_path, out_point_fc)
+make_archive(newGDB_path, newGDB_zip)
+arcpy.AddMessage('GDB saved to '+newGDB_zip+'\n')
+
+arcpy.AddMessage('Clearing Scratch GDB...')
+clear_gdb()
+arcpy.AddMessage('Scratch GDB cleared.\n')
+
+#  Download hosted feature layers
+arcpy.AddMessage('\nDownloading online layers...')
+flayer = gis.content.get(layer_id)
+pointLayer = flayer.layers[0]
+lineLayer = flayer.layers[1]
+
+
+search_results = gis.content.search("title:CAD_to_AOL_Update_"+date_strf)
+if len(search_results) > 0 :
+    search_item = search_results[0]
+    search_item.delete()
+
+arcpy.AddMessage('Download complete.\nUploading zipped GDB...')
+updateGDB_properties = {'title': 'CAD_to_AOL_Update_'+date_strf,
+						'type': 'File Geodatabase', 
+						'tags': 'Automated'}
+updateGDB_item = gis.content.add(data= newGDB_zip, item_properties=updateGDB_properties)
+						 # https://developers.arcgis.com/python/guide/working-with-feature-layers-and-features/
+arcpy.AddMessage('Done.\nAppending new features to existing layers...')
+statusLine = lineLayer.append(item_id=updateGDB_item.id,
+										upload_format='filegdb',
+										source_table_name=out_line_fc)
+statusPoint = pointLayer.append(item_id=updateGDB_item.id,
+										upload_format='filegdb',
+										source_table_name=out_point_fc)
+
+arcpy.AddMessage('Finding and removing duplicate features...')
+# Compare new features to existing features, deleting older versions
+remove_dup_lines()
+remove_dup_points()
+
+# Upload attachments to features
+arcpy.AddMessage('Uploading attachments to features...')
+
+#		Generate an attachment dictionary to link .pdf paths to updated ObjectIDs
+attach_df = lineLayer.query(out_fields='OBJECTID,y').sdf
+attach_dict = {}
+for file in os.listdir(dir_path):
+	if os.path.splitext(file)[1].upper() == '.PDF':
+		pdfName = os.path.splitext(file)[0].upper()
+		pdfJob = pdfName.split('_')[1]
+		pdfPath = os.path.join(dir_path, file)
+		attach_dict[pdfJob] = pdfPath
+#		Link ObjectID and pdfPath via Job_Name == pdfJob
+drop_index = []
+for i in range(len(attach_df)):
+	if attach_df.loc[i, 'y'] in attach_dict.keys():
+		attach_df.loc[i, 'y'] = attach_dict[attach_df.loc[i, 'y']]
+	else:
+		drop_index.append(i)
+attach_df.drop(drop_index, inplace=True)
+		# attach_df is now ['OBJECTID', 'pdfPath'] for only the jobs with pdfs to upload
+attach_df.rename(columns = {'Job_Name':'pdfPath'}, inplace=True)
+attach_df.reset_index(drop=True, inplace=True)
+#		Add attachments by ObjectID, pdfPath
+for i in range(len(attach_df)):
+	lineLayer.attachments.add(attach_df.loc[i, 'OBJECTID'], attach_df.loc[i, 'pdfPath'])
+
+
+# Move and Zip Processed .dwg's to 'Processed' Folder with date in name
+arcpy.AddMessage('Complete.\nCleaning folders...')
+[os.rename(os.path.join(dir_path, file), os.path.join(dir_path, file.replace("999", " "))) for file in os.listdir(dir_path) if file.endswith(ext)]
+
+zip_name = 'DWGs_Processed_' + date_strf
+dest = os.path.join(archive, zip_name)
+try:
+	os.mkdir(dest)
+except:
+	pass #	path already exists
+
+for file in dwg_list: 
+	file = file.replace("999", " ")
+	shutil.move(file, dest) 	# move dwg files to new folder 'dest'
+								# v move pdf files to new folder 'dest'
+[shutil.move(os.path.join(dir_path, file), dest) for file in os.listdir(dir_path) if file.endswith('.pdf')]
+
+make_archive(dest, dest+'.zip')	# zip 'dest' in archive
+
+# Empty CAD_to_ArcOnline; delete non-zipped folders in Archive
+[os.remove(os.path.join(dir_path, file)) for file in os.listdir(dir_path) if file.endswith(ext)]
+[os.remove(os.path.join(dir_path, file)) for file in os.listdir(dir_path) if file.endswith('.pdf')]
+
+for folder in os.listdir(archive):
+	fp = os.path.join(archive, folder)
+	if is_zipfile(fp):
+		pass
+	else:
+		shutil.rmtree(fp, ignore_errors = True)
+
+arcpy.AddMessage('Complete.\n')
+arcpy.AddMessage('Script successful.  \nExiting...')
+raise SystemExit()
